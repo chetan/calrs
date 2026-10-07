@@ -1136,28 +1136,20 @@ fn http_client() -> reqwest::Client {
 }
 
 async fn calendar_api_get(access_token: &str, url: &str) -> Result<Value> {
-    tracing::debug!(method = "GET", url, "google meet: Calendar API request");
     let resp = http_client()
         .get(url)
         .bearer_auth(access_token)
         .send()
         .await?;
-    calendar_api_response("GET", url, resp).await
-}
-
-// Full event bodies are opt-in debug diagnostics; never log authorization headers.
-async fn calendar_api_response(method: &str, url: &str, resp: reqwest::Response) -> Result<Value> {
-    let status = resp.status();
-    let body = resp.text().await?;
-    tracing::debug!(method, url, %status, response = %body, "google meet: Calendar API response");
-    if !status.is_success() {
-        return Err(anyhow!("Google Calendar {} {} : {}", method, status, body));
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Google Calendar GET {} : {}", status, body));
     }
-    Ok(serde_json::from_str(&body)?)
+    Ok(resp.json().await?)
 }
 
 async fn calendar_api_patch(access_token: &str, url: &str, body: &Value) -> Result<Value> {
-    tracing::debug!(method = "PATCH", url, request = %body, "google meet: Calendar API request");
     let resp = http_client()
         .patch(url)
         .bearer_auth(access_token)
@@ -1165,7 +1157,12 @@ async fn calendar_api_patch(access_token: &str, url: &str, body: &Value) -> Resu
         .json(body)
         .send()
         .await?;
-    calendar_api_response("PATCH", url, resp).await
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Google Calendar PATCH {} : {}", status, body));
+    }
+    Ok(resp.json().await?)
 }
 
 #[cfg(test)]
