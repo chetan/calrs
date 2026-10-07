@@ -21620,6 +21620,7 @@ async fn caldav_push_booking_for_user(
     }
 
     let ics = crate::email::generate_ics_caldav(details);
+    let google_ics = crate::email::generate_ics_google_caldav(details);
     let mut preserved_meet_href = false;
 
     for (
@@ -21764,7 +21765,15 @@ async fn caldav_push_booking_for_user(
                     continue;
                 }
             };
-            client.put_event(calendar_href, booking_uid, &ics).await
+            let source_ics =
+                if auth_type == "oauth2" && oauth2_provider.as_deref() == Some("google") {
+                    &google_ics
+                } else {
+                    &ics
+                };
+            client
+                .put_event(calendar_href, booking_uid, source_ics)
+                .await
         };
 
         if let Err(e) = put_result {

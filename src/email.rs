@@ -526,7 +526,7 @@ fn first_name(full_name: &str) -> &str {
 }
 
 pub fn generate_ics(details: &BookingDetails, method: &str) -> String {
-    generate_ics_impl(details, method, false)
+    generate_ics_impl(details, method, false, false)
 }
 
 /// ICS for CalDAV write-back (RFC 4791: no METHOD). ATTENDEE lines carry
@@ -536,13 +536,23 @@ pub fn generate_ics(details: &BookingDetails, method: &str) -> String {
 /// (in UTC) for every written booking. Email .ics attachments keep plain
 /// ATTENDEE;RSVP=TRUE so mail clients still offer "Add to calendar".
 pub fn generate_ics_caldav(details: &BookingDetails) -> String {
-    generate_ics_impl(details, "", true)
+    generate_ics_impl(details, "", true, false)
+}
+
+/// Personal Google calendar copy: calrs sends the guest invitations via SMTP.
+/// Google can still send invitations despite SCHEDULE-AGENT=CLIENT, so omit
+/// attendees altogether. Omit ORGANIZER too: Google assigns the calendar's
+/// identity instead of treating the booking email alias as an external organizer,
+/// which prevents native Meet creation. Guest-facing ICS retains that alias.
+pub fn generate_ics_google_caldav(details: &BookingDetails) -> String {
+    generate_ics_impl(details, "", true, true)
 }
 
 fn generate_ics_impl(
     details: &BookingDetails,
     method: &str,
     schedule_agent_client: bool,
+    host_only: bool,
 ) -> String {
     let guest_first = first_name(&details.guest_name);
     let host_first = first_name(&details.host_name);
@@ -560,11 +570,34 @@ fn generate_ics_impl(
         .as_ref()
         .map(|l| format!("LOCATION:{}\r\n", sanitize_ics(l)))
         .unwrap_or_default();
-    let description_line = details
-        .notes
+    let description = if host_only {
+        let mut description = format!("{} <{}>", details.guest_name, details.guest_email);
+        for email in &details.additional_attendees {
+            description.push('\n');
+            description.push_str(email);
+        }
+        if let Some(notes) = details.notes.as_ref().filter(|n| !n.trim().is_empty()) {
+            description.push_str("\n\n");
+            description.push_str(notes);
+        }
+        Some(description)
+    } else {
+        details.notes.clone()
+    };
+    let description_line = description
         .as_ref()
         .filter(|n| !n.trim().is_empty())
-        .map(|n| format!("DESCRIPTION:{}\r\n", sanitize_ics(n)))
+        .map(|n| {
+            let value = if host_only {
+                n.split('\n')
+                    .map(|line| sanitize_ics(&line.replace('\\', "\\\\")))
+                    .collect::<Vec<_>>()
+                    .join("\\n")
+            } else {
+                sanitize_ics(n)
+            };
+            format!("DESCRIPTION:{value}\r\n")
+        })
         .unwrap_or_default();
     let valarm = details
         .reminder_minutes
@@ -584,11 +617,20 @@ fn generate_ics_impl(
     } else {
         ""
     };
-    let additional_attendee_lines: String = details
-        .additional_attendees
-        .iter()
-        .map(|email| format!("ATTENDEE{sa};RSVP=TRUE:mailto:{}\r\n", sanitize_ics(email)))
-        .collect();
+    let scheduling_lines = if host_only {
+        String::new()
+    } else {
+        let additional_attendee_lines: String = details
+            .additional_attendees
+            .iter()
+            .map(|email| format!("ATTENDEE{sa};RSVP=TRUE:mailto:{}\r\n", sanitize_ics(email)))
+            .collect();
+        format!(
+            "ORGANIZER;CN={host_name}:mailto:{host_email}\r\n\
+             ATTENDEE{sa};CN={guest_name};RSVP=TRUE:mailto:{guest_email}\r\n\
+             {additional_attendee_lines}"
+        )
+    };
     let dtstamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     // Convert guest-timezone times to UTC for the ICS
     let (dtstart, dtend) = details.utc_times.clone().unwrap_or_else(|| {
@@ -612,9 +654,7 @@ fn generate_ics_impl(
          SUMMARY:{summary}\r\n\
          {description_line}\
          {location_line}\
-         ORGANIZER;CN={host_name}:mailto:{host_email}\r\n\
-         ATTENDEE{sa};CN={guest_name};RSVP=TRUE:mailto:{guest_email}\r\n\
-         {additional_attendee_lines}\
+         {scheduling_lines}\
          STATUS:CONFIRMED\r\n\
          {valarm}\
          END:VEVENT\r\n\
@@ -631,11 +671,7 @@ fn generate_ics_impl(
         summary = summary,
         description_line = description_line,
         location_line = location_line,
-        host_name = host_name,
-        host_email = host_email,
-        guest_name = guest_name,
-        guest_email = guest_email,
-        additional_attendee_lines = additional_attendee_lines,
+        scheduling_lines = scheduling_lines,
     )
 }
 
@@ -3574,6 +3610,39 @@ mod tests {
             "email .ics must keep plain ATTENDEE lines"
         );
         assert!(email.contains("ATTENDEE;CN=Jane Doe;RSVP=TRUE:mailto:jane@example.com"));
+    }
+
+    #[test]
+    fn google_calendar_copy_is_host_only_but_email_keeps_booking_identity() {
+        let details = BookingDetails {
+            event_title: "Intro Call".into(),
+            date: "2026-03-10".into(),
+            start_time: "14:00".into(),
+            end_time: "14:30".into(),
+            guest_name: "Jane Doe".into(),
+            guest_email: "jane@example.com".into(),
+            guest_timezone: "UTC".into(),
+            host_name: "Alice".into(),
+            host_email: "alias@example.com".into(),
+            uid: "host-only-booking@calrs".into(),
+            notes: Some("Discuss plans\nATTENDEE:mailto:injected@example.com".into()),
+            location: Some("https://meet.google.com/aaa-bbbb-ccc".into()),
+            additional_attendees: vec!["bob@example.com".into()],
+            ..Default::default()
+        };
+        let google = generate_ics_google_caldav(&details);
+        assert!(!google.contains("\r\nATTENDEE"));
+        assert!(!google.contains("\r\nORGANIZER"));
+        assert!(!google.contains("\r\nMETHOD:"));
+        assert!(google.contains("DESCRIPTION:Jane Doe <jane@example.com>\\nbob@example.com\\n\\nDiscuss plans\\nATTENDEE:mailto:injected@example.com\r\n"));
+        assert!(google.contains("UID:host-only-booking@calrs\r\n"));
+        assert!(google.contains("DTSTART:20260310T140000Z\r\n"));
+        assert!(google.contains("LOCATION:https://meet.google.com/aaa-bbbb-ccc\r\n"));
+
+        let email = generate_ics(&details, "REQUEST");
+        assert!(email.contains("ORGANIZER;CN=Alice:mailto:alias@example.com\r\n"));
+        assert!(email.contains("ATTENDEE;CN=Jane Doe;RSVP=TRUE:mailto:jane@example.com\r\n"));
+        assert!(email.contains("ATTENDEE;RSVP=TRUE:mailto:bob@example.com\r\n"));
     }
 
     // Regression test for #49: DTSTAMP is REQUIRED in VEVENT by RFC 5545 §3.6.1.

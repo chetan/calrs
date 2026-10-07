@@ -392,8 +392,8 @@ pub async fn should_skip_caldav_put(
 
 /// Elect the user whose Google account owns the Meet conference.
 ///
-/// Matches write-back host identity so the ORGANIZER and the Meet token
-/// holder are the same person (Google 403s an organizer mismatch).
+/// Matches write-back host identity so the calendar and Meet token holder are
+/// the same person. The host-only ICS lets Google assign its own organizer.
 pub async fn elect_meet_owner(pool: &SqlitePool, booking_id: &str) -> Option<String> {
     let row: Option<(
         Option<String>,
@@ -675,7 +675,7 @@ pub async fn create_meet_for_booking_with_config(
     };
 
     let details = booking_details_for_meet(pool, booking_id, &owner_id).await?;
-    let ics = crate::email::generate_ics_caldav(&details);
+    let ics = crate::email::generate_ics_google_caldav(&details);
 
     if let Err(e) = api
         .put_ics(
@@ -1378,6 +1378,7 @@ mod tests {
         omit_status_on_patch: bool,
         hangout: String,
         events: Mutex<HashMap<String, String>>,
+        last_ics: Mutex<Option<String>>,
     }
 
     impl FakeApi {
@@ -1394,6 +1395,7 @@ mod tests {
                 omit_status_on_patch: false,
                 hangout: hangout.to_string(),
                 events: Mutex::new(HashMap::new()),
+                last_ics: Mutex::new(None),
             }
         }
     }
@@ -1406,9 +1408,10 @@ mod tests {
             _access_token: &str,
             _calendar_href: &str,
             uid: &str,
-            _ics: &str,
+            ics: &str,
         ) -> Result<()> {
             self.put_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_ics.lock().unwrap() = Some(ics.to_string());
             self.events
                 .lock()
                 .unwrap()
@@ -2045,6 +2048,11 @@ mod tests {
         assert_eq!(url.as_deref(), Some("https://meet.google.com/created-room"));
         assert_eq!(api.put_count.load(Ordering::SeqCst), 1);
         assert_eq!(api.conference_patches.load(Ordering::SeqCst), 1);
+        let ics = api.last_ics.lock().unwrap();
+        let ics = ics.as_deref().unwrap();
+        assert!(!ics.contains("\r\nATTENDEE"));
+        assert!(!ics.contains("\r\nORGANIZER"));
+        assert!(ics.contains("DESCRIPTION:"));
     }
 
     /// Seed a decryptable access token so the retry tests reach the fake API
