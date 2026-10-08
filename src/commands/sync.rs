@@ -145,11 +145,18 @@ pub async fn sync_source(
 
         let cal_label = cal_info.display_name.as_deref().unwrap_or(&cal_info.href);
 
-        // Google status events are read through the Calendar API, independently
-        // of CalDAV change markers. Refresh even when the CalDAV ctag is unchanged.
+        // Google status events are only supported on the primary calendar and
+        // are read through the Calendar API independently of CalDAV change
+        // markers. Refresh even when the CalDAV ctag is unchanged.
         if let Some(token) = client.google_access_token() {
-            match crate::google_calendar::sync_out_of_office(pool, &cal_id, &cal_info.href, token)
-                .await
+            match crate::google_calendar::sync_out_of_office(
+                pool,
+                &cal_id,
+                client.base_url(),
+                &cal_info.href,
+                token,
+            )
+            .await
             {
                 Ok(count) => {
                     tracing::debug!(calendar = %cal_label, count, "Google out-of-office synced")

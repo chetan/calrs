@@ -146,6 +146,10 @@ impl CaldavClient {
         }
     }
 
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn new(base_url: &str, username: &str, password: &str) -> Self {
         Self::build(
             base_url,
