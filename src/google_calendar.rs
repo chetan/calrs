@@ -36,11 +36,21 @@ struct EventPage {
 pub(crate) async fn sync_out_of_office(
     pool: &SqlitePool,
     calendar_id: &str,
+    primary_calendar_href: &str,
     href: &str,
     token: &str,
 ) -> Result<usize> {
     let remote_id = crate::google_meet::calendar_id_from_caldav_href(href)
         .context("Invalid Google calendar collection href")?;
+    let primary_id = crate::google_meet::calendar_id_from_caldav_href(primary_calendar_href)
+        .context("Invalid Google primary calendar href")?;
+    // Google supports status events only on primary calendars. Subscribed
+    // holidays and other secondary collections can return 404 for this query.
+    if !remote_id.eq_ignore_ascii_case(&primary_id) {
+        tracing::debug!("skipping Google out-of-office query for secondary calendar");
+        replace_snapshot(pool, calendar_id, &[]).await?;
+        return Ok(0);
+    }
     let url = format!(
         "https://www.googleapis.com/calendar/v3/calendars/{}/events",
         urlencoding::encode(&remote_id)
@@ -86,7 +96,10 @@ async fn fetch_out_of_office(
         }
         let response = request.send().await?;
         if !response.status().is_success() {
-            bail!("Google out-of-office fetch: HTTP {}", response.status());
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let detail = body.chars().take(512).collect::<String>();
+            bail!("Google out-of-office fetch: HTTP {}: {}", status, detail);
         }
         let page: EventPage = response.json().await?;
         events.extend(page.items);
@@ -293,6 +306,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn secondary_calendar_skips_api_call_and_clears_any_old_snapshot() {
+        let pool = database().await;
+        replace_snapshot(
+            &pool,
+            "other",
+            &[absence(
+                "stale",
+                "2026-10-26T09:00:00Z",
+                "2026-10-26T10:00:00Z",
+            )],
+        )
+        .await
+        .unwrap();
+        let count = sync_out_of_office(
+            &pool,
+            "other",
+            "https://apidata.googleusercontent.com/caldav/v2/host%40example.com/user",
+            "https://apidata.googleusercontent.com/caldav/v2/en.usa%23holiday%40group.v.calendar.google.com/events",
+            "must-not-be-used",
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE calendar_id = 'other' AND google_out_of_office = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
     async fn fetch_paginates_expanded_status_events_and_rejects_partial_results() {
         async fn page(
             headers: HeaderMap,
@@ -306,7 +352,11 @@ mod tests {
             assert_eq!(query["timeMax"], "2027-10-01T00:00:00Z");
             if query.contains_key("pageToken") {
                 if query["timeMin"] == "fail" {
-                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    return (
+                        axum::http::StatusCode::NOT_FOUND,
+                        Json(json!({"error": {"message": "Requested entity was not found."}})),
+                    )
+                        .into_response();
                 }
                 return Json(json!({"items": [{"id": "second", "eventType": "outOfOffice"}]}))
                     .into_response();
@@ -330,11 +380,27 @@ mod tests {
         .unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].id, "second");
-        assert!(
-            fetch_out_of_office(&url, "test-token", "fail", "2027-10-01T00:00:00Z")
-                .await
-                .is_err()
-        );
+        let error = fetch_out_of_office(&url, "test-token", "fail", "2027-10-01T00:00:00Z")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Requested entity was not found"));
         server.abort();
+    }
+
+    #[test]
+    fn secondary_google_calendars_are_not_status_event_sources() {
+        let primary = "https://apidata.googleusercontent.com/caldav/v2/alice%40example.com/events";
+        let holidays = "https://apidata.googleusercontent.com/caldav/v2/en.usa%23holiday%40group.v.calendar.google.com/events";
+        let same_primary =
+            "https://apidata.googleusercontent.com/caldav/v2/ALICE%40EXAMPLE.COM/events";
+        assert!(crate::google_meet::calendar_id_from_caldav_href(primary)
+            .unwrap()
+            .eq_ignore_ascii_case(
+                &crate::google_meet::calendar_id_from_caldav_href(same_primary).unwrap()
+            ));
+        assert_ne!(
+            crate::google_meet::calendar_id_from_caldav_href(primary),
+            crate::google_meet::calendar_id_from_caldav_href(holidays)
+        );
     }
 }
