@@ -13227,6 +13227,8 @@ async fn fetch_busy_times_for_user_ex(
     // still make the booking conflict with its own calendar copy.
     let exclude_uid = exclude_booking_uid.unwrap_or("");
 
+    // API status events are UTC, while the requested window is host-local.
+    // Fetch them with timezone slack, then test overlap after conversion below.
     let events: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT e.start_at, e.end_at, e.timezone FROM events e
          JOIN calendars c ON c.id = e.calendar_id
@@ -13239,7 +13241,10 @@ async fn fetch_busy_times_for_user_ex(
            AND (e.status IS NULL OR e.status != 'CANCELLED')
            AND (e.transp IS NULL OR e.transp != 'TRANSPARENT')
            AND (? = '' OR e.uid != ?)
-           AND e.start_at <= ? AND e.end_at >= ?",
+           AND ((e.start_at <= ? AND e.end_at >= ?)
+                OR (e.google_out_of_office = 1
+                    AND e.start_at <= strftime('%Y%m%dT%H%M%S', ?, '+2 days')
+                    AND e.end_at >= strftime('%Y%m%dT%H%M%S', ?, '-2 days')))",
     )
     .bind(user_id)
     .bind(et_id_for_filter)
@@ -13248,6 +13253,8 @@ async fn fetch_busy_times_for_user_ex(
     .bind(exclude_uid)
     .bind(&end_compact)
     .bind(&start_compact)
+    .bind(&end_iso)
+    .bind(&start_iso)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -13257,7 +13264,7 @@ async fn fetch_busy_times_for_user_ex(
         .filter_map(|(s, e, tz)| {
             let start = convert_event_to_tz(parse_ical_datetime(s)?, tz.as_deref(), host_tz);
             let end = convert_event_to_tz(parse_ical_datetime(e)?, tz.as_deref(), host_tz);
-            Some((start, end))
+            (start <= window_end && end >= window_start).then_some((start, end))
         })
         .collect();
 
@@ -15766,7 +15773,10 @@ async fn troubleshoot(
            AND (e.rrule IS NULL OR e.rrule = '')
            AND (e.status IS NULL OR e.status != 'CANCELLED')
            AND (e.transp IS NULL OR e.transp != 'TRANSPARENT')
-           AND ((e.start_at < ? AND e.end_at > ?) OR (e.start_at < ? AND e.end_at > ?))
+           AND ((e.start_at < ? AND e.end_at > ?) OR (e.start_at < ? AND e.end_at > ?)
+                OR (e.google_out_of_office = 1
+                    AND e.start_at <= strftime('%Y%m%dT%H%M%S', ?, '+2 days')
+                    AND e.end_at >= strftime('%Y%m%dT%H%M%S', ?, '-2 days')))
          ORDER BY e.start_at",
     )
     .bind(&user.id)
@@ -15774,6 +15784,8 @@ async fn troubleshoot(
     .bind(&et_id)
     .bind(&day_end_compact)
     .bind(&day_start_compact)
+    .bind(&day_end_iso)
+    .bind(&day_start_iso)
     .bind(&day_end_iso)
     .bind(&day_start_iso)
     .fetch_all(&state.pool)
@@ -15785,6 +15797,9 @@ async fn troubleshoot(
         .filter_map(|(s, e, summary, cal_name, event_tz)| {
             let start = convert_event_to_tz(parse_ical_datetime(s)?, event_tz.as_deref(), host_tz);
             let end = convert_event_to_tz(parse_ical_datetime(e)?, event_tz.as_deref(), host_tz);
+            if start.date() > target_date || end.date() < target_date {
+                return None;
+            }
             Some((
                 start.format("%Y-%m-%dT%H:%M:%S").to_string(),
                 end.format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -23650,6 +23665,91 @@ mod tests {
         .await;
 
         assert!(busy.is_empty(), "TRANSPARENT events must not block");
+    }
+
+    #[tokio::test]
+    async fn google_out_of_office_blocks_in_host_timezone_and_respects_calendar_selection() {
+        let pool = setup_test_db().await;
+        let (user_id, account_id, et_id) = seed_test_data(&pool).await;
+        seed_synced_event(
+            &pool,
+            &account_id,
+            "20261024T220000Z",
+            "20261025T230000Z",
+            "UTC",
+            "OPAQUE",
+        )
+        .await;
+        sqlx::query("UPDATE events SET google_out_of_office = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let paris: Tz = "Europe/Paris".parse().unwrap();
+        let start = dt(2026, 10, 25, 9, 0);
+        let end = dt(2026, 10, 25, 17, 0);
+        let busy =
+            fetch_busy_times_for_user(&pool, &user_id, start, end, paris, Some(&et_id)).await;
+        assert_eq!(busy, vec![(dt(2026, 10, 25, 0, 0), dt(2026, 10, 26, 0, 0))]);
+        assert!(has_conflict(&busy, start, end));
+
+        sqlx::query("UPDATE calendars SET is_busy = 0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            fetch_busy_times_for_user(&pool, &user_id, start, end, paris, Some(&et_id))
+                .await
+                .is_empty()
+        );
+        sqlx::query("UPDATE calendars SET is_busy = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO calendars (id, source_id, href, is_busy) SELECT 'unselected', source_id, '/other/', 1 FROM calendars LIMIT 1")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO event_type_calendars (event_type_id, calendar_id) VALUES (?, 'unselected')")
+            .bind(&et_id).execute(&pool).await.unwrap();
+        assert!(
+            fetch_busy_times_for_user(&pool, &user_id, start, end, paris, Some(&et_id))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn google_out_of_office_timed_interval_blocks_across_utc_date_boundary() {
+        let pool = setup_test_db().await;
+        let (user_id, account_id, et_id) = seed_test_data(&pool).await;
+        seed_synced_event(
+            &pool,
+            &account_id,
+            "20261025T233000Z",
+            "20261026T003000Z",
+            "UTC",
+            "OPAQUE",
+        )
+        .await;
+        sqlx::query("UPDATE events SET google_out_of_office = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let tokyo: Tz = "Asia/Tokyo".parse().unwrap();
+        let start = dt(2026, 10, 26, 8, 30);
+        let end = dt(2026, 10, 26, 9, 30);
+        let busy =
+            fetch_busy_times_for_user(&pool, &user_id, start, end, tokyo, Some(&et_id)).await;
+        assert_eq!(busy, vec![(start, end)]);
+        assert!(has_conflict(&busy, start, end));
+        assert!(fetch_busy_times_for_user(
+            &pool,
+            &user_id,
+            dt(2026, 10, 27, 8, 30),
+            dt(2026, 10, 27, 9, 30),
+            tokyo,
+            Some(&et_id)
+        )
+        .await
+        .is_empty());
     }
 
     #[tokio::test]

@@ -88,6 +88,21 @@ You have two options:
 
 For a self-hosted instance used by you and a handful of people, the Testing mode + Test users approach is usually fine; just remember the 7-day refresh token expiry.
 
+## Out-of-office blocking
+
+calrs also reads Google Calendar's **Out of office** events through the Calendar
+API using the existing OAuth connection. No additional scope or reconnect is
+required. These events block availability on their connected calendar, respecting
+the calendar's busy toggle and per-event-type calendar selection.
+
+Google represents these as timed, busy intervals, including absences that cover
+whole days. Recurring absences are expanded by Google, including moved and
+cancelled occurrences and daylight-saving changes. Each sync refreshes a window
+from 90 days ago to 366 days ahead, covering the web booking flow's 365-day limit.
+Deleted absences are removed on the next successful sync. If the API request
+fails, previously cached absences remain blocking until a successful refresh.
+Working-location events are not treated as absences.
+
 ## Invitations and booking email aliases
 
 Events written to a connected Google calendar are host-only, including Google Meet bookings. The guest's name and email, additional guest emails, and booking notes appear in the description rather than the attendee list. calrs sends guest emails and ICS attachments through its configured SMTP server, avoiding duplicate invitations from Google Calendar. Guest RSVPs are not tracked on the Google host event.
