@@ -97,8 +97,9 @@ required. These events block availability on their connected calendar, respectin
 the calendar's busy toggle and per-event-type calendar selection.
 
 Google represents these as timed, busy intervals, including absences that cover
-whole days. Recurring absences are expanded by Google, including moved and
-cancelled occurrences and daylight-saving changes. Each sync refreshes a window
+whole days. Recurring absences are expanded by Google, including moved occurrences
+and daylight-saving changes. Cancelled occurrences are omitted from the returned
+snapshot and stop blocking after the next successful sync. Each sync refreshes a window
 from 90 days ago to 366 days ahead, covering the web booking flow's 365-day limit.
 Deleted absences are removed on the next successful sync. If the API request
 fails, previously cached absences remain blocking until a successful refresh.

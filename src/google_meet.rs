@@ -1169,8 +1169,7 @@ async fn calendar_api_get(access_token: &str, url: &str) -> Result<Value> {
         .await?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Google Calendar GET {} : {}", status, body));
+        return Err(anyhow!("Google Calendar GET {}", status));
     }
     Ok(resp.json().await?)
 }
@@ -1185,8 +1184,7 @@ async fn calendar_api_patch(access_token: &str, url: &str, body: &Value) -> Resu
         .await?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Google Calendar PATCH {} : {}", status, body));
+        return Err(anyhow!("Google Calendar PATCH {}", status));
     }
     Ok(resp.json().await?)
 }
@@ -1200,6 +1198,41 @@ mod tests {
     use std::str::FromStr;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn calendar_api_errors_omit_response_bodies() {
+        async fn rejected() -> (axum::http::StatusCode, &'static str) {
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                "private calendar response contents",
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events", listener.local_addr().unwrap());
+        let app =
+            axum::Router::new().route("/events", axum::routing::get(rejected).patch(rejected));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let get_error = calendar_api_get("test-token", &url).await.unwrap_err();
+        let patch_error = calendar_api_patch("test-token", &url, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        server.abort();
+
+        for (method, error) in [("GET", get_error), ("PATCH", patch_error)] {
+            let message = format!("{error:#}");
+            assert!(message.contains(method), "{message}");
+            assert!(message.contains("403"), "{message}");
+            assert!(
+                !message.contains("private calendar response contents"),
+                "{message}"
+            );
+            assert!(!message.contains("test-token"), "{message}");
+        }
+    }
 
     #[test]
     fn calendar_id_from_primary_email_href() {

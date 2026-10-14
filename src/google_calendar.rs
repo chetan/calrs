@@ -97,9 +97,7 @@ async fn fetch_out_of_office(
         let response = request.send().await?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let detail = body.chars().take(512).collect::<String>();
-            bail!("Google out-of-office fetch: HTTP {}: {}", status, detail);
+            bail!("Google out-of-office fetch: HTTP {}", status);
         }
         let page: EventPage = response.json().await?;
         events.extend(page.items);
@@ -383,7 +381,8 @@ mod tests {
         let error = fetch_out_of_office(&url, "test-token", "fail", "2027-10-01T00:00:00Z")
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("Requested entity was not found"));
+        assert!(error.to_string().contains("HTTP 404"));
+        assert!(!error.to_string().contains("Requested entity was not found"));
         server.abort();
     }
 
