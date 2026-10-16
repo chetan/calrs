@@ -575,6 +575,7 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
 
     Router::new()
         .merge(crate::auth::auth_router())
+        .merge(crate::oauth::router())
         .route("/", get(root_redirect))
         .route("/dashboard", get(dashboard))
         .route("/dashboard/event-types", get(dashboard_event_types))

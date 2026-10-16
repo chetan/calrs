@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}{{ t("oauth-title") }} — calrs{% endblock %}
+{% block content %}
+<div class="card" style="margin-top: 3rem;">
+  <h1>{{ t("oauth-title") }}</h1>
+  <p>{{ t("oauth-intro", email=email) }}</p>
+  <h2>{{ client_name }}</h2>
+  <p style="overflow-wrap: anywhere;"><code>{{ redirect_uri }}</code></p>
+  <ul>
+    {% if events %}<li>{{ t("oauth-events") }}</li>{% endif %}
+    {% if blocks %}<li>{{ t("oauth-blocks") }}</li>{% endif %}
+    {% if invites %}<li>{{ t("oauth-invites") }}</li>{% endif %}
+  </ul>
+  <form method="post" action="/oauth/consent">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <input type="hidden" name="request_id" value="{{ request_id }}">
+    <button class="btn" type="submit" name="decision" value="allow">{{ t("oauth-allow") }}</button>
+    <button class="btn" type="submit" name="decision" value="deny">{{ t("oauth-deny") }}</button>
+  </form>
+</div>
+{% endblock %}

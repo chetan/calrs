@@ -18,6 +18,7 @@ mod format;
 mod guards;
 mod hosts;
 mod invites;
+mod oauth;
 mod organizer;
 mod page_language;
 mod pending_hold;

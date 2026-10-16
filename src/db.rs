@@ -296,6 +296,10 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
             "070_booking_organizer",
             include_str!("../migrations/070_booking_organizer.sql"),
         ),
+        (
+            "071_oauth_server",
+            include_str!("../migrations/071_oauth_server.sql"),
+        ),
     ];
 
     let mut applied_count = 0u32;
