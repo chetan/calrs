@@ -6,7 +6,7 @@ const CALLBACK: &str = "http://127.0.0.1:4321/callback";
 const RESOURCE: &str = "https://cal.example/mcp";
 const VERIFIER: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH";
 
-fn environment() -> crate::test_support::EnvGuard {
+pub(super) fn environment() -> crate::test_support::EnvGuard {
     let guard = crate::test_support::EnvGuard::new();
     std::env::set_var("CALRS_BASE_URL", "https://cal.example");
     guard

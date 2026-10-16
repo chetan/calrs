@@ -552,6 +552,28 @@ pub(super) async fn generate_quick_link(
         return resp;
     }
 
+    match create_quick_invite(&state.pool, &auth_user.user, &event_type_id, false).await {
+        Ok(Some(invite)) => axum::Json(serde_json::json!({ "url": invite.url })).into_response(),
+        Ok(None) => Redirect::to("/dashboard/invite-links").into_response(),
+        Err(e) => internal_error_response("create quick invite", &e),
+    }
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct QuickInvite {
+    pub url: String,
+    pub expires_at: String,
+    pub max_uses: i32,
+}
+
+/// Shared by the dashboard and MCP. Internal events are distributable by any
+/// user; other event types require management permission. No email is sent.
+pub(super) async fn create_quick_invite(
+    pool: &SqlitePool,
+    user: &crate::models::User,
+    event_type_id: &str,
+    include_public: bool,
+) -> Result<Option<QuickInvite>, sqlx::Error> {
     let et: Option<(String, String, Option<String>, Option<String>, String)> = sqlx::query_as(
         "SELECT et.id, et.slug,
                 CASE WHEN et.team_id IS NOT NULL THEN t.slug ELSE NULL END,
@@ -561,25 +583,25 @@ pub(super) async fn generate_quick_link(
          LEFT JOIN teams t ON t.id = et.team_id
          LEFT JOIN accounts a ON a.id = et.account_id
          LEFT JOIN users u ON u.id = a.user_id
-         WHERE et.id = ? AND et.visibility IN ('private', 'internal')",
+         WHERE et.id = ? AND et.enabled = 1
+           AND (et.visibility IN ('private', 'internal') OR ?)",
     )
-    .bind(&event_type_id)
-    .fetch_optional(&state.pool)
-    .await
-    .unwrap_or(None);
+    .bind(event_type_id)
+    .bind(include_public)
+    .fetch_optional(pool)
+    .await?;
 
     let (et_id, et_slug, team_slug, username, visibility) = match et {
         Some(e) => e,
-        None => return Redirect::to("/dashboard/invite-links").into_response(),
+        None => return Ok(None),
     };
 
     // Private event types: only owner (personal) or team admin (team event)
     // can generate quick links. Internal event types remain open to any
     // authenticated user — that's the documented "any authenticated colleague
     // can distribute a one-time link" contract.
-    if visibility == "private" && !can_manage_event_type(&state.pool, &auth_user.user, &et_id).await
-    {
-        return Redirect::to("/dashboard/invite-links").into_response();
+    if visibility != "internal" && !can_manage_event_type(pool, user, &et_id).await {
+        return Ok(None);
     }
 
     let token = uuid::Uuid::new_v4().to_string();
@@ -587,7 +609,7 @@ pub(super) async fn generate_quick_link(
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
 
-    let _ = sqlx::query(
+    sqlx::query(
         "INSERT INTO booking_invites (id, event_type_id, token, guest_name, guest_email, expires_at, max_uses, created_by_user_id)
          VALUES (?, ?, ?, '', '', ?, 1, ?)",
     )
@@ -595,11 +617,11 @@ pub(super) async fn generate_quick_link(
     .bind(&et_id)
     .bind(&token)
     .bind(&expires_at)
-    .bind(&auth_user.user.id)
-    .execute(&state.pool)
-    .await;
+    .bind(&user.id)
+    .execute(pool)
+    .await?;
 
-    tracing::info!(event_type = %et_id, created_by = %auth_user.user.email, "quick invite link generated");
+    tracing::info!(event_type = %et_id, created_by = %user.email, "quick invite link generated");
 
     let base_url = crate::settings::base_url().unwrap_or_default();
     let invite_url = if let Some(ts) = &team_slug {
@@ -607,9 +629,12 @@ pub(super) async fn generate_quick_link(
     } else if let Some(un) = &username {
         format!("{}/u/{}/{}?invite={}", base_url, un, et_slug, token)
     } else {
-        format!("{}?invite={}", base_url, token)
+        format!("{}/{}?invite={}", base_url, et_slug, token)
     };
 
-    // Return JSON with the URL for the frontend to copy
-    axum::Json(serde_json::json!({ "url": invite_url })).into_response()
+    Ok(Some(QuickInvite {
+        url: invite_url,
+        expires_at,
+        max_uses: 1,
+    }))
 }

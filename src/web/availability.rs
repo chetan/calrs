@@ -609,6 +609,35 @@ pub(super) async fn fetch_busy_times_for_user_opts(
     exclude_booking_uid: Option<&str>,
     include_pending_holds: bool,
 ) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    try_fetch_busy_times_for_user_opts(
+        pool,
+        user_id,
+        window_start,
+        window_end,
+        host_tz,
+        event_type_id,
+        exclude_booking_id,
+        exclude_booking_uid,
+        include_pending_holds,
+    )
+    .await
+    .unwrap_or_default()
+}
+
+/// Fallible entry point for integrations, which must not report an empty
+/// calendar when a database query fails.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn try_fetch_busy_times_for_user_opts(
+    pool: &SqlitePool,
+    user_id: &str,
+    window_start: NaiveDateTime,
+    window_end: NaiveDateTime,
+    host_tz: Tz,
+    event_type_id: Option<&str>,
+    exclude_booking_id: Option<&str>,
+    exclude_booking_uid: Option<&str>,
+    include_pending_holds: bool,
+) -> Result<Vec<(NaiveDateTime, NaiveDateTime)>, sqlx::Error> {
     // Events are stored in compact iCal form ("YYYYMMDDTHHMMSS" for timed,
     // "YYYYMMDD" for all-day), so both overlap bounds must also be compact
     // with a time component. Using a date-only upper bound here ("YYYYMMDD")
@@ -651,8 +680,7 @@ pub(super) async fn fetch_busy_times_for_user_opts(
     .bind(&end_compact)
     .bind(&start_compact)
     .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    .await?;
 
     let mut busy: Vec<(NaiveDateTime, NaiveDateTime)> = events
         .iter()
@@ -685,8 +713,7 @@ pub(super) async fn fetch_busy_times_for_user_opts(
     .bind(&end_iso)
     .bind(&end_compact_rrule)
     .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    .await?;
 
     busy.extend(expand_recurring_into_busy(
         &recurring,
@@ -724,8 +751,7 @@ pub(super) async fn fetch_busy_times_for_user_opts(
     .bind(exclude_id)
     .bind(exclude_id)
     .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    .await?;
 
     for (s, e) in &bookings {
         if let Some((start, end)) = crate::booking_time::busy_range(s, e, host_tz) {
@@ -733,7 +759,7 @@ pub(super) async fn fetch_busy_times_for_user_opts(
         }
     }
 
-    busy
+    Ok(busy)
 }
 
 /// Check if any busy period overlaps with [buf_start, buf_end).
