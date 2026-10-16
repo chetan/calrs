@@ -448,3 +448,60 @@ async fn mcp_sparse_pagination_and_failed_insert_do_not_issue_links() {
     let response = app.clone().oneshot(rpc(token,json!({"jsonrpc":"2.0","method":"tools/call","params":{"name":"create_invite_link","arguments":{"event_type_id":et}}}))).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn mcp_public_links_are_reusable_and_private_team_links_work() {
+    let _lock = crate::test_support::ENV_LOCK.lock().await;
+    let _env = oauth::environment();
+    let (app, pool, session, et) = setup_test_app().await;
+    let (_, tokens) = oauth::issue_tokens(&app, &session).await;
+    let token = tokens["access_token"].as_str().unwrap();
+    let result = call(
+        &app,
+        token,
+        "create_invite_link",
+        json!({"event_type_id":et}),
+    )
+    .await;
+    assert_eq!(result["isError"], false);
+    assert_eq!(
+        result["structuredContent"]["url"],
+        "https://cal.example/u/testuser/test-meeting"
+    );
+    assert!(result["structuredContent"]["expires_at"].is_null());
+    assert!(result["structuredContent"]["max_uses"].is_null());
+    let (team, team_et) = insert_team_with_et(&pool, "hidden-team", "demo", &[]).await;
+    sqlx::query(
+        "UPDATE teams SET visibility = 'private', invite_token = 'team-token' WHERE id = ?",
+    )
+    .bind(&team)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let result = call(
+        &app,
+        token,
+        "create_invite_link",
+        json!({"event_type_id":team_et}),
+    )
+    .await;
+    assert_eq!(result["isError"], false);
+    assert_eq!(
+        result["structuredContent"]["url"],
+        "https://cal.example/team/hidden-team/demo?invite=team-token"
+    );
+    let response = app
+        .clone()
+        .oneshot(get("/team/hidden-team/demo?invite=team-token"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM booking_invites")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "public links must not promise unenforced invite limits"
+    );
+}

@@ -562,8 +562,8 @@ pub(super) async fn generate_quick_link(
 #[derive(serde::Serialize)]
 pub(super) struct QuickInvite {
     pub url: String,
-    pub expires_at: String,
-    pub max_uses: i32,
+    pub expires_at: Option<String>,
+    pub max_uses: Option<i32>,
 }
 
 /// Shared by the dashboard and MCP. Internal events are distributable by any
@@ -574,11 +574,19 @@ pub(super) async fn create_quick_invite(
     event_type_id: &str,
     include_public: bool,
 ) -> Result<Option<QuickInvite>, sqlx::Error> {
-    let et: Option<(String, String, Option<String>, Option<String>, String)> = sqlx::query_as(
+    let et: Option<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+    )> = sqlx::query_as(
         "SELECT et.id, et.slug,
                 CASE WHEN et.team_id IS NOT NULL THEN t.slug ELSE NULL END,
                 CASE WHEN et.team_id IS NULL THEN u.username ELSE NULL END,
-                et.visibility
+                et.visibility,
+                CASE WHEN t.visibility = 'private' THEN t.invite_token ELSE NULL END
          FROM event_types et
          LEFT JOIN teams t ON t.id = et.team_id
          LEFT JOIN accounts a ON a.id = et.account_id
@@ -591,7 +599,7 @@ pub(super) async fn create_quick_invite(
     .fetch_optional(pool)
     .await?;
 
-    let (et_id, et_slug, team_slug, username, visibility) = match et {
+    let (et_id, et_slug, team_slug, username, visibility, team_token) = match et {
         Some(e) => e,
         None => return Ok(None),
     };
@@ -602,6 +610,29 @@ pub(super) async fn create_quick_invite(
     // can distribute a one-time link" contract.
     if visibility != "internal" && !can_manage_event_type(pool, user, &et_id).await {
         return Ok(None);
+    }
+
+    let base_url = crate::settings::base_url().unwrap_or_default();
+    let booking_url = if let Some(ts) = &team_slug {
+        format!("{}/team/{}/{}", base_url, ts, et_slug)
+    } else if let Some(un) = &username {
+        format!("{}/u/{}/{}", base_url, un, et_slug)
+    } else {
+        format!("{}/{}", base_url, et_slug)
+    };
+    // Public booking handlers do not consume booking_invites. Return their
+    // real reusable URL rather than promising an unenforced single-use link.
+    // Public events in private teams use the team's existing access token.
+    if visibility == "public" {
+        let url = match team_token {
+            Some(token) => format!("{}?invite={}", booking_url, urlencoding::encode(&token)),
+            None => booking_url,
+        };
+        return Ok(Some(QuickInvite {
+            url,
+            expires_at: None,
+            max_uses: None,
+        }));
     }
 
     let token = uuid::Uuid::new_v4().to_string();
@@ -623,18 +654,9 @@ pub(super) async fn create_quick_invite(
 
     tracing::info!(event_type = %et_id, created_by = %user.email, "quick invite link generated");
 
-    let base_url = crate::settings::base_url().unwrap_or_default();
-    let invite_url = if let Some(ts) = &team_slug {
-        format!("{}/team/{}/{}?invite={}", base_url, ts, et_slug, token)
-    } else if let Some(un) = &username {
-        format!("{}/u/{}/{}?invite={}", base_url, un, et_slug, token)
-    } else {
-        format!("{}/{}?invite={}", base_url, et_slug, token)
-    };
-
     Ok(Some(QuickInvite {
-        url: invite_url,
-        expires_at,
-        max_uses: 1,
+        url: format!("{}?invite={}", booking_url, token),
+        expires_at: Some(expires_at),
+        max_uses: Some(1),
     }))
 }

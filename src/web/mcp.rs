@@ -202,7 +202,7 @@ fn tools() -> Value {
         {"name": "list_event_types", "description": "List enabled event types you can distribute: your managed personal/team events and internal events. Use an event_type_id with create_invite_link. Follow next_cursor until null.",
          "inputSchema": {"type":"object", "properties":{"cursor":{"type":"string","description":"next_cursor from the previous page"}}, "additionalProperties":false},
          "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
-        {"name": "create_invite_link", "description": "Create a single-use booking invite link, expiring in 7 days, for an enabled event type. Sends no email and makes no booking. Internal events are available to all users; other events require owner/team-admin permission. Public events remain bookable through their public URL. Each call creates a new link.",
+        {"name": "create_invite_link", "description": "Get a booking link for an enabled event type. Internal/private events get a new single-use invite expiring in 7 days. Public events return their reusable booking URL (null expiry/use limit); private teams use their existing team access token. Sends no email or booking. Internal events are available to all users; others require owner/team-admin permission.",
          "inputSchema":{"type":"object","properties":{"event_type_id":{"type":"string"}},"required":["event_type_id"],"additionalProperties":false},
          "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
         {"name": "get_calendar_blocks", "description": "Get your own busy intervals from the current calendar cache and bookings (including pending holds). RFC3339 start/end, at most 31 days. Returns merged UTC intervals and source sync health, never event titles or other people's calendars. This does not calculate bookable slots or refresh remote calendars.",
@@ -280,7 +280,7 @@ async fn call_tool(
                 invite.url = format!("{}{}", crate::oauth::issuer(), invite.url);
             }
             Ok(
-                json!({"url":invite.url,"expires_at":invite.expires_at.replace(' ', "T") + "Z","max_uses":invite.max_uses}),
+                json!({"url":invite.url,"expires_at":invite.expires_at.map(|v| v.replace(' ', "T") + "Z"),"max_uses":invite.max_uses}),
             )
         }
         "get_calendar_blocks" => {

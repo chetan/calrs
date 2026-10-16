@@ -394,3 +394,88 @@ async fn oauth_rotation_revocation_expiry_and_disabled_users() {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn oauth_concurrent_refresh_has_one_winner_and_revokes_the_family() {
+    let _lock = crate::test_support::ENV_LOCK.lock().await;
+    let _env = environment();
+    let (app, pool, session, _) = setup_test_app().await;
+    let (client, tokens) = issue_tokens(&app, &session).await;
+    let original = tokens["refresh_token"].as_str().unwrap();
+    let (a, b) = tokio::join!(
+        refresh(&app, &client, original),
+        refresh(&app, &client, original)
+    );
+    let (winner, loser) = if a.status() == StatusCode::OK {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    assert_eq!(winner.status(), StatusCode::OK);
+    assert_eq!(loser.status(), StatusCode::BAD_REQUEST);
+    let winner = json_body(winner).await;
+    assert!(!accepted(&pool, winner["access_token"].as_str().unwrap()).await);
+    assert_eq!(
+        refresh(&app, &client, winner["refresh_token"].as_str().unwrap())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn oauth_password_login_resumes_and_expired_consent_is_rejected() {
+    let _lock = crate::test_support::ENV_LOCK.lock().await;
+    let _env = environment();
+    let (app, pool, session, _) = setup_test_app().await;
+    let password = crate::auth::hash_password("test-password").unwrap();
+    sqlx::query("UPDATE users SET password_hash = ? WHERE email = 'test@example.com'")
+        .bind(password)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let client = register_client(&app).await;
+    let response = app
+        .clone()
+        .oneshot(get(&authorization_uri(&client)))
+        .await
+        .unwrap();
+    let request = request_cookie(&response);
+    let mut login = post_form_unauthed(
+        "/auth/login",
+        "csrf",
+        "_csrf=csrf&email=test%40example.com&password=test-password",
+    );
+    login.headers_mut().insert(
+        "cookie",
+        format!("__Host-calrs_csrf=csrf; __Host-calrs_oauth={request}")
+            .parse()
+            .unwrap(),
+    );
+    let response = app.clone().oneshot(login).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/oauth/consent");
+    assert!(response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .any(|v| v.to_str().unwrap().starts_with("__Host-calrs_session=")));
+    let request = begin_consent(&app, &client, &session).await;
+    sqlx::query("UPDATE oauth_requests SET expires_at = 0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(consent_request(&session, &request, "allow", "csrf"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let grants: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_grants")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(grants, 0);
+}
