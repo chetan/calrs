@@ -734,10 +734,12 @@ pub(super) async fn try_fetch_busy_times_for_user_opts(
     // (`pending_blocks_slot`, on by default): otherwise a second guest is
     // offered the slot, fills the form, and is bounced at submit, and an
     // overlapping slot on another event type could be requested as well (#234).
-    let bookings: Vec<(String, String)> = sqlx::query_as(&format!(
-        "SELECT CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at FROM bookings b
+    let bookings: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT b.start_at, b.end_at, b.time_version,
+                COALESCE(NULLIF(et.timezone, ''), u.timezone) FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
+         LEFT JOIN users u ON u.id = a.user_id
          WHERE {}
            AND b.start_at <= strftime('%Y-%m-%dT%H:%M:%S', ?, '+2 days') AND b.end_at >= strftime('%Y-%m-%dT%H:%M:%S', ?, '-2 days')
            AND (? = '' OR b.id != ?)",
@@ -753,8 +755,14 @@ pub(super) async fn try_fetch_busy_times_for_user_opts(
     .fetch_all(pool)
     .await?;
 
-    for (s, e) in &bookings {
-        if let Some((start, end)) = crate::booking_time::busy_range(s, e, host_tz) {
+    for (s, e, version, zone) in &bookings {
+        let legacy_tz = zone
+            .as_deref()
+            .and_then(|z| z.parse().ok())
+            .unwrap_or(Tz::UTC);
+        if let Some((start, end)) =
+            crate::booking_time::stored_busy_range(s, e, *version, legacy_tz, host_tz)
+        {
             busy.push((start, end));
         }
     }

@@ -450,6 +450,112 @@ async fn mcp_sparse_pagination_and_failed_insert_do_not_issue_links() {
 }
 
 #[tokio::test]
+async fn mcp_legacy_bookings_use_event_or_owner_timezone_and_preserve_utc_rows() {
+    let _lock = crate::test_support::ENV_LOCK.lock().await;
+    let _env = oauth::environment();
+    let (app, pool, session, event) = setup_test_app().await;
+    sqlx::query("UPDATE users SET timezone = 'America/New_York'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let owner: String = sqlx::query_scalar("SELECT user_id FROM sessions WHERE id = ?")
+        .bind(&session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let inherited = insert_personal_et(&pool, &owner, "owner-zone").await;
+    let tokyo = insert_personal_et(&pool, &owner, "tokyo-zone").await;
+    sqlx::query("UPDATE event_types SET timezone = 'Europe/Paris' WHERE id = ?")
+        .bind(&event)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE event_types SET timezone = 'Asia/Tokyo' WHERE id = ?")
+        .bind(&tokyo)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The legacy Z suffix does not indicate UTC when time_version is zero.
+    insert_test_booking(
+        &pool,
+        &event,
+        "2026-07-01T10:00:00Z",
+        "2026-07-01T10:30:00Z",
+        "confirmed",
+    )
+    .await;
+    insert_test_booking(
+        &pool,
+        &inherited,
+        "2026-07-01T10:00:00",
+        "2026-07-01T10:30:00",
+        "pending",
+    )
+    .await;
+    insert_test_booking(
+        &pool,
+        &tokyo,
+        "2026-07-02T00:30:00",
+        "2026-07-02T01:00:00",
+        "confirmed",
+    )
+    .await;
+    let (utc, _, _) = insert_test_booking(
+        &pool,
+        &event,
+        "2026-07-01T12:00:00Z",
+        "2026-07-01T12:30:00Z",
+        "confirmed",
+    )
+    .await;
+    sqlx::query("UPDATE bookings SET time_version = 1 WHERE id = ?")
+        .bind(&utc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, tokens) = oauth::issue_tokens(&app, &session).await;
+    let token = tokens["access_token"].as_str().unwrap();
+    let result = call(
+        &app,
+        token,
+        "get_calendar_blocks",
+        json!({"start":"2026-07-01T00:00:00Z", "end":"2026-07-02T00:00:00Z"}),
+    )
+    .await;
+    assert_eq!(
+        result["structuredContent"]["blocks"],
+        json!([
+            {"start":"2026-07-01T08:00:00+00:00", "end":"2026-07-01T08:30:00+00:00"},
+            {"start":"2026-07-01T12:00:00+00:00", "end":"2026-07-01T12:30:00+00:00"},
+            {"start":"2026-07-01T14:00:00+00:00", "end":"2026-07-01T14:30:00+00:00"},
+            {"start":"2026-07-01T15:30:00+00:00", "end":"2026-07-01T16:00:00+00:00"}
+        ])
+    );
+    // A repeated legacy wall clock has two possible UTC interpretations.
+    insert_test_booking(
+        &pool,
+        &event,
+        "2026-10-25T02:15:00",
+        "2026-10-25T02:45:00",
+        "confirmed",
+    )
+    .await;
+    let result = call(
+        &app,
+        token,
+        "get_calendar_blocks",
+        json!({"start":"2026-10-25T00:00:00Z", "end":"2026-10-25T04:00:00Z"}),
+    )
+    .await;
+    assert_eq!(
+        result["structuredContent"]["blocks"],
+        json!([
+            {"start":"2026-10-25T00:15:00+00:00", "end":"2026-10-25T01:45:00+00:00"}
+        ])
+    );
+}
+
+#[tokio::test]
 async fn mcp_public_links_are_reusable_and_private_team_links_work() {
     let _lock = crate::test_support::ENV_LOCK.lock().await;
     let _env = oauth::environment();
