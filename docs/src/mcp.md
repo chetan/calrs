@@ -137,6 +137,11 @@ The browser approval page lists the requested scopes:
 | `invites:write` | `create_invite_link` |
 
 Clients may request a subset; omitting scope requests all three. Authorization
+permits only the listed scopes. On refresh, scope order does not matter. A
+narrower request limits the new access token, while the grant and replacement
+refresh token retain their original permissions. Omitting scope on refresh uses
+the original grant permissions. Existing access tokens keep their own scopes.
+Authorization
 and token requests must include `resource=<public-base-url>/mcp`. Public clients
 use `token_endpoint_auth_method=none`, authorization code with **S256 PKCE**, and
 an exactly registered HTTPS or loopback HTTP callback URI.

@@ -396,6 +396,78 @@ async fn oauth_rotation_revocation_expiry_and_disabled_users() {
 }
 
 #[tokio::test]
+async fn oauth_refresh_scopes_are_sets_and_narrow_only_the_new_access_token() {
+    let _lock = crate::test_support::ENV_LOCK.lock().await;
+    let _env = environment();
+    let (app, pool, session, _) = setup_test_app().await;
+    let (client, original) = issue_tokens(&app, &session).await;
+    let mut current = original.clone();
+    for requested in [
+        "invites:write calendar:read event-types:read",
+        "calendar:read calendar:read",
+    ] {
+        let response = app.clone().oneshot(post_form_unauthed("/oauth/token", "", &format!(
+            "grant_type=refresh_token&client_id={client}&refresh_token={}&resource={}&scope={}",
+            current["refresh_token"].as_str().unwrap(), urlencoding::encode(RESOURCE), urlencoding::encode(requested)
+        ))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        current = json_body(response).await;
+    }
+    assert_eq!(current["scope"], "calendar:read");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        format!("Bearer {}", current["access_token"].as_str().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    let (_, actual_scope) = crate::oauth::bearer_user(&pool, &headers, RESOURCE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual_scope, "calendar:read");
+    // Exercise enforcement at the protected resource, not just the token JSON.
+    let response = app.clone().oneshot(Request::builder().method("POST").uri("/mcp")
+        .header("authorization", headers["authorization"].clone())
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_invite_link","arguments":{"event_type_id":"irrelevant"}}}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    headers.insert(
+        "authorization",
+        format!("Bearer {}", original["access_token"].as_str().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    let (_, actual_scope) = crate::oauth::bearer_user(&pool, &headers, RESOURCE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual_scope, original["scope"].as_str().unwrap());
+    for requested in ["", "  ", "calendar:read admin:write"] {
+        let response = app.clone().oneshot(post_form_unauthed("/oauth/token", "", &format!(
+            "grant_type=refresh_token&client_id={client}&refresh_token={}&resource={}&scope={}",
+            current["refresh_token"].as_str().unwrap(), urlencoding::encode(RESOURCE), urlencoding::encode(requested)
+        ))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["error"], "invalid_scope");
+    }
+    let response = refresh(&app, &client, current["refresh_token"].as_str().unwrap()).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "invalid scope must not consume the refresh token"
+    );
+    assert_eq!(json_body(response).await["scope"], original["scope"]);
+    let granted: String = sqlx::query_scalar("SELECT scope FROM oauth_grants WHERE client_id = ?")
+        .bind(&client)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(granted, original["scope"].as_str().unwrap());
+}
+
+#[tokio::test]
 async fn oauth_concurrent_refresh_has_one_winner_and_revokes_the_family() {
     let _lock = crate::test_support::ENV_LOCK.lock().await;
     let _env = environment();

@@ -470,9 +470,17 @@ async fn token(
         tx.commit().await?;
         return Err(invalid("invalid_grant"));
     }
-    if form.scope.as_ref().is_some_and(|s| s != &row.scope) {
-        return Err(invalid("invalid_scope"));
-    }
+    let scope = match form.scope.as_deref() {
+        Some(requested) => {
+            let granted: std::collections::BTreeSet<_> = row.scope.split_whitespace().collect();
+            let requested: std::collections::BTreeSet<_> = requested.split_whitespace().collect();
+            if requested.is_empty() || !requested.is_subset(&granted) {
+                return Err(invalid("invalid_scope"));
+            }
+            requested.into_iter().collect::<Vec<_>>().join(" ")
+        }
+        None => row.scope.clone(),
+    };
     sqlx::query("UPDATE oauth_credentials SET used = 1 WHERE hash = ?")
         .bind(hash(value))
         .execute(&mut *tx)
@@ -485,12 +493,15 @@ async fn token(
         (&refresh, "refresh", row.expires_at),
     ] {
         sqlx::query(
-            "INSERT INTO oauth_credentials (hash, grant_id, kind, expires_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO oauth_credentials (hash, grant_id, kind, expires_at, scope) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(hash(secret))
         .bind(&row.grant_id)
         .bind(kind)
         .bind(expiry)
+        // A rotated refresh token retains the original grant's scope (RFC
+        // 6749 section 6). Only this access token receives the requested subset.
+        .bind((kind == "access").then_some(&scope))
         .execute(&mut *tx)
         .await?;
     }
@@ -499,7 +510,7 @@ async fn token(
         [("Cache-Control", "no-store"), ("Pragma", "no-cache")],
         Json(json!({
             "access_token": access, "token_type": "Bearer", "expires_in": access_expiry - now,
-            "refresh_token": refresh, "scope": row.scope
+            "refresh_token": refresh, "scope": scope
         })),
     )
         .into_response())
@@ -536,11 +547,16 @@ pub async fn bearer_user(
     if !scheme.eq_ignore_ascii_case("bearer") || token.len() != 43 {
         return Ok(None);
     }
-    let row: Option<(String, String)> = sqlx::query_as("SELECT g.user_id, g.scope FROM oauth_credentials c JOIN oauth_grants g ON g.id = c.grant_id WHERE c.hash = ? AND c.kind = 'access' AND c.expires_at > ? AND g.expires_at > ? AND g.revoked = 0 AND g.resource = ?")
+    let row: Option<(String, String, String)> = sqlx::query_as("SELECT g.user_id, COALESCE(c.scope, g.scope), g.scope FROM oauth_credentials c JOIN oauth_grants g ON g.id = c.grant_id WHERE c.hash = ? AND c.kind = 'access' AND c.expires_at > ? AND g.expires_at > ? AND g.revoked = 0 AND g.resource = ?")
         .bind(hash(token)).bind(Utc::now().timestamp()).bind(Utc::now().timestamp()).bind(audience).fetch_optional(pool).await?;
-    let Some((id, scope)) = row else {
+    let Some((id, scope, granted)) = row else {
         return Ok(None);
     };
+    let scope = scope
+        .split_whitespace()
+        .filter(|s| granted.split_whitespace().any(|g| g == *s))
+        .collect::<Vec<_>>()
+        .join(" ");
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ? AND enabled = 1")
         .bind(id)
         .fetch_optional(pool)
