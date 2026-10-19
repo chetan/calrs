@@ -202,8 +202,8 @@ fn tools() -> Value {
         {"name": "list_event_types", "description": "List enabled event types you can distribute: your managed personal/team events and internal events. Use an event_type_id with create_invite_link. Follow next_cursor until null.",
          "inputSchema": {"type":"object", "properties":{"cursor":{"type":"string","description":"next_cursor from the previous page"}}, "additionalProperties":false},
          "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
-        {"name": "create_invite_link", "description": "Get a booking link for an enabled event type. Internal/private events get a new single-use invite expiring in 7 days. Public events return their reusable booking URL (null expiry/use limit); private teams use their existing team access token. Sends no email or booking. Internal events are available to all users; others require owner/team-admin permission.",
-         "inputSchema":{"type":"object","properties":{"event_type_id":{"type":"string"}},"required":["event_type_id"],"additionalProperties":false},
+        {"name": "create_invite_link", "description": "Get a booking link for an enabled event type. Internal/private events get a new single-use invite with configurable expiry (default 7 days). Public events return their reusable booking URL (null expiry/use limit); private teams use their existing team access token. Sends no email or booking. Internal events are available to all users; others require owner/team-admin permission.",
+         "inputSchema":{"type":"object","properties":{"event_type_id":{"type":"string"},"expires_days":{"type":"integer","enum":[0,7,14,30],"default":7,"description":"Invite expiry: 7, 14, or 30 days; 0 means never. Applies only to internal/private events."}},"required":["event_type_id"],"additionalProperties":false},
          "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
         {"name": "get_calendar_blocks", "description": "Get your own busy intervals from the current calendar cache and bookings (including pending holds). RFC3339 start/end, at most 31 days. Returns merged UTC intervals and source sync health, never event titles or other people's calendars. This does not calculate bookable slots or refresh remote calendars.",
          "inputSchema":{"type":"object","properties":{"start":{"type":"string","format":"date-time"},"end":{"type":"string","format":"date-time"}},"required":["start","end"],"additionalProperties":false},
@@ -220,6 +220,12 @@ struct ListArgs {
 #[serde(deny_unknown_fields)]
 struct InviteArgs {
     event_type_id: String,
+    #[serde(default = "default_invite_expiry")]
+    expires_days: i32,
+}
+
+fn default_invite_expiry() -> i32 {
+    7
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -265,15 +271,20 @@ async fn call_tool(
             Ok(json!({"event_types":events,"next_cursor":next}))
         }
         "create_invite_link" => {
-            let args: InviteArgs =
-                serde_json::from_value(arguments).map_err(|_| "Expected event_type_id only.")?;
+            let args: InviteArgs = serde_json::from_value(arguments).map_err(|_| {
+                "Expected event_type_id and optional integer expires_days (0, 7, 14, or 30)."
+            })?;
             if args.event_type_id.is_empty() || args.event_type_id.len() > 64 {
                 return Err("Invalid event_type_id.".into());
             }
-            let mut invite = create_quick_invite(pool, user, &args.event_type_id, true)
-                .await
-                .map_err(db_error)?
-                .ok_or("Event type not found, disabled, or not permitted.")?;
+            if !matches!(args.expires_days, 0 | 7 | 14 | 30) {
+                return Err("Invalid expires_days; use 0 (never), 7, 14, or 30.".into());
+            }
+            let mut invite =
+                create_quick_invite(pool, user, &args.event_type_id, true, args.expires_days)
+                    .await
+                    .map_err(db_error)?
+                    .ok_or("Event type not found, disabled, or not permitted.")?;
             // The CLI/dev fallback mirrors OAuth discovery; production uses the
             // same existing public URL setting as dashboard invite links.
             if invite.url.starts_with('/') {

@@ -51,7 +51,7 @@ filtering can produce a short or empty page that still has a next cursor.
 Arguments:
 
 ```json
-{"event_type_id":"<id from list_event_types>"}
+{"event_type_id":"<id from list_event_types>","expires_days":30}
 ```
 
 Example result:
@@ -64,7 +64,9 @@ Example result:
 }
 ```
 
-For internal and private events, the link expires after **seven days** and can be used for **one booking**. Guests
+For internal and private events, `expires_days` accepts **7**, **14**, **30**, or **0**
+(never), matching the UI. Omit it to default to **seven days**. Never-expiring
+invites return `expires_at: null`. Each link can be used for **one booking**. Guests
 enter their own name and email. Team links use `/team/{team}/{event}?invite=...`.
 The tool creates the same invitation records as the dashboard quick-link action;
 it sends no email and creates no booking. You can manage the resulting internal
@@ -73,7 +75,8 @@ and private invites on the dashboard's invite-management page.
 Internal events are available to any authenticated user. Private and public
 events require owner, team-admin, or global-admin permissions. Disabled events
 are rejected. Public events return their ordinary **reusable booking URL**, with
-`expires_at: null` and `max_uses: null`, without inserting an invitation record.
+`expires_at: null` and `max_uses: null`, without inserting an invitation record;
+`expires_days` does not affect these public URLs.
 For public events belonging to a private team, the URL includes that team's
 existing reusable access token. Generating a link does not change visibility.
 

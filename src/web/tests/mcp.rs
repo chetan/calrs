@@ -150,6 +150,70 @@ async fn mcp_transport_auth_discovery_lifecycle_and_errors() {
 }
 
 #[tokio::test]
+async fn mcp_invite_expiry_options_are_persisted_and_validated() {
+    let _lock = crate::test_support::ENV_LOCK.lock().await;
+    let _env = oauth::environment();
+    let (app, pool, session, event) = setup_test_app().await;
+    sqlx::query("UPDATE event_types SET visibility = 'private'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, tokens) = oauth::issue_tokens(&app, &session).await;
+    let token = tokens["access_token"].as_str().unwrap();
+    for days in [7, 14, 30, 0] {
+        let before = Utc::now().naive_utc();
+        let result = call(
+            &app,
+            token,
+            "create_invite_link",
+            json!({"event_type_id":event,"expires_days":days}),
+        )
+        .await;
+        assert_eq!(result["isError"], false);
+        let invite = &result["structuredContent"];
+        assert_eq!(invite["max_uses"], 1);
+        let url = reqwest::Url::parse(invite["url"].as_str().unwrap()).unwrap();
+        let invite_token = url
+            .query_pairs()
+            .find(|(k, _)| k == "invite")
+            .unwrap()
+            .1
+            .into_owned();
+        let expiry: Option<String> =
+            sqlx::query_scalar("SELECT expires_at FROM booking_invites WHERE token = ?")
+                .bind(invite_token)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        if days == 0 {
+            assert!(expiry.is_none());
+            assert!(invite["expires_at"].is_null());
+        } else {
+            let expiry = expiry.unwrap();
+            assert_eq!(invite["expires_at"], expiry.replace(' ', "T") + "Z");
+            let actual = NaiveDateTime::parse_from_str(&expiry, "%Y-%m-%d %H:%M:%S").unwrap();
+            assert!(actual >= before + Duration::days(days) - Duration::seconds(1));
+            assert!(actual <= Utc::now().naive_utc() + Duration::days(days));
+        }
+    }
+    for invalid in [json!(-1), json!(8), json!("never"), json!(null), json!(7.5)] {
+        let result = call(
+            &app,
+            token,
+            "create_invite_link",
+            json!({"event_type_id":event,"expires_days":invalid}),
+        )
+        .await;
+        assert_eq!(result["isError"], true);
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM booking_invites")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 4);
+}
+
+#[tokio::test]
 async fn mcp_invites_follow_permissions_and_use_real_booking_flow() {
     let _lock = crate::test_support::ENV_LOCK.lock().await;
     let _env = oauth::environment();

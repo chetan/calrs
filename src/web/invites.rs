@@ -552,7 +552,7 @@ pub(super) async fn generate_quick_link(
         return resp;
     }
 
-    match create_quick_invite(&state.pool, &auth_user.user, &event_type_id, false).await {
+    match create_quick_invite(&state.pool, &auth_user.user, &event_type_id, false, 7).await {
         Ok(Some(invite)) => axum::Json(serde_json::json!({ "url": invite.url })).into_response(),
         Ok(None) => Redirect::to("/dashboard/invite-links").into_response(),
         Err(e) => internal_error_response("create quick invite", &e),
@@ -573,6 +573,7 @@ pub(super) async fn create_quick_invite(
     user: &crate::models::User,
     event_type_id: &str,
     include_public: bool,
+    expires_days: i32,
 ) -> Result<Option<QuickInvite>, sqlx::Error> {
     let et: Option<(
         String,
@@ -636,9 +637,11 @@ pub(super) async fn create_quick_invite(
     }
 
     let token = uuid::Uuid::new_v4().to_string();
-    let expires_at = (chrono::Utc::now() + chrono::Duration::days(7))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+    let expires_at = (expires_days > 0).then(|| {
+        (chrono::Utc::now() + chrono::Duration::days(i64::from(expires_days)))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    });
 
     sqlx::query(
         "INSERT INTO booking_invites (id, event_type_id, token, guest_name, guest_email, expires_at, max_uses, created_by_user_id)
@@ -656,7 +659,7 @@ pub(super) async fn create_quick_invite(
 
     Ok(Some(QuickInvite {
         url: format!("{}?invite={}", booking_url, token),
-        expires_at: Some(expires_at),
+        expires_at,
         max_uses: Some(1),
     }))
 }
