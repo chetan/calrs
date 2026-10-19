@@ -175,6 +175,81 @@ fn valid_redirect(uri: &str) -> bool {
             .any(|(k, _)| matches!(k.as_ref(), "code" | "state" | "error" | "iss"))
 }
 
+// RFC 8252 section 7.3: native apps choose an available loopback port at
+// authorization time. Compare the remaining URI literally, without URL
+// normalization that could also change the host, path, or query.
+fn redirect_matches(registered: &str, requested: &str) -> bool {
+    fn loopback_parts(uri: &str) -> Option<(&str, &str)> {
+        if !valid_redirect(uri) {
+            return None;
+        }
+        let rest = uri.strip_prefix("http://")?;
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, suffix) = rest.split_at(end);
+        for host in ["127.0.0.1", "[::1]", "localhost"] {
+            if let Some(port) = authority.strip_prefix(host) {
+                if port.is_empty()
+                    || port
+                        .strip_prefix(':')
+                        .is_some_and(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+                {
+                    return Some((host, suffix));
+                }
+            }
+        }
+        None
+    }
+
+    registered == requested
+        || loopback_parts(registered)
+            .zip(loopback_parts(requested))
+            .is_some_and(|(a, b)| a == b)
+}
+
+#[test]
+fn loopback_redirect_matching_only_relaxes_the_port() {
+    for host in ["127.0.0.1", "[::1]", "localhost"] {
+        let registered = format!("http://{host}:4321/callback?app=calrs");
+        for port in [":52319", "", ":80"] {
+            assert!(redirect_matches(
+                &registered,
+                &format!("http://{host}{port}/callback?app=calrs")
+            ));
+        }
+        for requested in [
+            format!("https://{host}:52319/callback?app=calrs"),
+            format!("http://{host}:52319/other?app=calrs"),
+            format!("http://{host}:52319/callback?app=other"),
+            format!("http://{host}:52319/a/../callback?app=calrs"),
+            format!("http://{host}:52319/callback?app=calrs#fragment"),
+            format!("http://user@{host}:52319/callback?app=calrs"),
+        ] {
+            assert!(!redirect_matches(&registered, &requested), "{requested}");
+        }
+    }
+    for (registered, requested) in [
+        (
+            "http://127.0.0.1:4321/callback",
+            "http://localhost:52319/callback",
+        ),
+        (
+            "http://127.0.0.1:4321/callback",
+            "http://127.0.0.2:52319/callback",
+        ),
+        (
+            "https://example.com:4321/callback",
+            "https://example.com:52319/callback",
+        ),
+        (
+            "https://127.0.0.1:4321/callback",
+            "https://127.0.0.1:52319/callback",
+        ),
+    ] {
+        assert!(!redirect_matches(registered, requested));
+        assert!(redirect_matches(registered, registered));
+    }
+}
+
 async fn register(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -249,7 +324,10 @@ async fn authorize(
     let uris: Vec<String> = uris
         .and_then(|v| serde_json::from_str(&v).ok())
         .ok_or(invalid("invalid_client"))?;
-    if !uris.contains(&params.redirect_uri) {
+    if !uris
+        .iter()
+        .any(|uri| redirect_matches(uri, &params.redirect_uri))
+    {
         return Err(invalid("invalid_request"));
     }
     if params.response_type != "code" {

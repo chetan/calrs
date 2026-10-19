@@ -184,6 +184,59 @@ async fn oauth_discovery_and_registration_validation() {
 }
 
 #[tokio::test]
+async fn oauth_loopback_port_changes_preserve_token_redirect_binding() {
+    let _lock = crate::test_support::ENV_LOCK.lock().await;
+    let _env = environment();
+    let (app, _, session, _) = setup_test_app().await;
+    let client = register_client(&app).await;
+    let response = app
+        .clone()
+        .oneshot(get(&authorization_uri(&client).replace("4321", "52319")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let request = request_cookie(&response);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/consent")
+                .header(
+                    "cookie",
+                    format!("__Host-calrs_session={session}; __Host-calrs_oauth={request}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(consent_request(&session, &request, "allow", "csrf"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let url = reqwest::Url::parse(response.headers()["location"].to_str().unwrap()).unwrap();
+    assert_eq!(url.port(), Some(52319));
+    let code = url
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .unwrap()
+        .1
+        .into_owned();
+    // The registered port must not redeem a code issued for the new port.
+    let response = exchange(&app, &client, &code, VERIFIER, RESOURCE).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["error"], "invalid_grant");
+    let response = app.clone().oneshot(post_form_unauthed("/oauth/token", "", &format!(
+        "grant_type=authorization_code&client_id={client}&code={code}&code_verifier={VERIFIER}&redirect_uri={}&resource={}",
+        urlencoding::encode("http://127.0.0.1:52319/callback"), urlencoding::encode(RESOURCE),
+    ))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn oauth_pkce_client_resource_redirect_and_code_replay() {
     let _lock = crate::test_support::ENV_LOCK.lock().await;
     let _env = environment();
@@ -192,7 +245,7 @@ async fn oauth_pkce_client_resource_redirect_and_code_replay() {
     for uri in [
         authorization_uri(&client).replace("S256", "plain"),
         authorization_uri(&client).replace("cal.example", "evil.example"),
-        authorization_uri(&client).replace("4321", "4322"),
+        authorization_uri(&client).replace("callback", "other-path"),
     ] {
         let response = app.clone().oneshot(get(&uri)).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
